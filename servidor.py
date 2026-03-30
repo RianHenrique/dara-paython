@@ -304,7 +304,7 @@ class Servidor:
                 estado["pecas_no_tabuleiro"][oponente - 1] -= 1
 
                 # Verifica vitória: oponente com 2 ou menos peças?
-                # (sem verificação de fase, igual ao Node)
+                # Sem verificação de fase — a condição é simples:
                 if estado["pecas_no_tabuleiro"][oponente - 1] <= 2:
                     # Envia o tabuleiro atualizado primeiro (peça sumindo)
                     # antes de mandar o "fim", assim o cliente vê a captura

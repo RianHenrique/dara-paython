@@ -21,7 +21,6 @@ def obter_linhas(tabuleiro, jogador):
 
     Usar identificadores (em vez de True/False) permite comparar os
     sets antes e depois de um movimento, detectando apenas trios NOVOS
-    — evitando o bug de trios antigos serem contados de novo.
     """
     linhas = set()
 
@@ -64,7 +63,6 @@ def formaria_linha(tabuleiro, jogador, linha, coluna):
 def criar_estado():
     """
     Cria e retorna o estado inicial de uma partida zerada.
-    Espelho da função criarEstadoInicial() do jogo.js.
 
     Campos:
       tabuleiro          — grade 5x6, 0=vazio, 1=jogador1, 2=jogador2
