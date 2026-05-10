@@ -1,14 +1,18 @@
-import socket
+# cliente.py — Cliente RPC com Pyro5
+# Interface gráfica Tkinter + polling para receber atualizações do servidor.
+
+import time
 import threading
-import json
+import Pyro5.api
 import tkinter as tk
 from tkinter import messagebox, scrolledtext
 
 # ─── Constantes ───────────────────────────────────────────────
-LINHAS       = 5
-COLUNAS      = 6
-PORTA        = 5000
-TAMANHO_CASA = 80
+LINHAS        = 5
+COLUNAS       = 6
+PORTA         = 9090
+TAMANHO_CASA  = 80
+POLL_INTERVAL = 0.3   # segundos entre cada chamada get_estado()
 
 CORES = {
     0:             "#d4b896",
@@ -22,17 +26,23 @@ CORES = {
 # ─── Cliente ──────────────────────────────────────────────────
 class ClienteDara:
     def __init__(self):
-        self.sock           = None
-        self.meu_numero     = None
-        self.estado         = None
-        self.selecionado    = None
-        self.buffer         = ""
-        self.jogo_encerrado = False
-        self._ultimo_ip     = "127.0.0.1"   # guardado para reconectar
+        self.proxy        = None
+        self.proxy_lock   = threading.Lock()
+        self.meu_numero   = None
+        self.estado       = None
+        self.selecionado  = None
+        self._polling     = False
+        self.jogo_encerrado   = False
+        self.ultimo_chat_idx  = 0
+        self.ultimo_msg_seq   = -1
+        self._jogo_iniciado   = False
+        self._ultimo_ip       = "127.0.0.1"
+        self._btn_nova        = None
 
         self.janela = tk.Tk()
         self.janela.title("Jogo Dara")
         self.janela.resizable(False, False)
+        self.janela.protocol("WM_DELETE_WINDOW", self._fechar_janela)
 
         self.construir_tela_conexao()
         self.janela.mainloop()
@@ -40,6 +50,7 @@ class ClienteDara:
     # ══════════════════════════════════════════════════════════
     # TELA DE CONEXÃO
     # ══════════════════════════════════════════════════════════
+
     def construir_tela_conexao(self, ip="127.0.0.1"):
         self.frame_conexao = tk.Frame(self.janela, padx=30, pady=30)
         self.frame_conexao.pack()
@@ -63,89 +74,128 @@ class ClienteDara:
                                      font=("Arial", 10), fg="gray")
         self.label_status.pack()
 
-    # ----------------------------------------------------------
     def conectar(self):
         ip = self.entrada_ip.get().strip()
         self._ultimo_ip = ip
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((ip, PORTA))
-            self.label_status.config(text="Conectado! Aguardando...", fg="green")
-            threading.Thread(target=self.receber, daemon=True).start()
-        except Exception as e:
-            self.label_status.config(text=f"Erro: {e}", fg="red")
+            uri         = f"PYRO:dara.servidor@{ip}:{PORTA}"
+            self.proxy  = Pyro5.api.Proxy(uri)
+            resultado   = self._rpc(lambda p: p.entrar())
 
-    # ══════════════════════════════════════════════════════════
-    # RECEPÇÃO (thread separada)
-    # ══════════════════════════════════════════════════════════
-    def receber(self):
-        while True:
-            try:
-                dados = self.sock.recv(4096).decode("utf-8")
-                if not dados:
-                    break
-                self.buffer += dados
-                while "\n" in self.buffer:
-                    linha, self.buffer = self.buffer.split("\n", 1)
-                    if linha.strip():
-                        msg = json.loads(linha)
-                        self.janela.after(0, self.processar_mensagem, msg)
-            except Exception:
-                break
+            if not resultado["ok"]:
+                self.label_status.config(text=f"Erro: {resultado['erro']}", fg="red")
+                return
 
-    # ══════════════════════════════════════════════════════════
-    # PROCESSAMENTO DE MENSAGENS
-    # ══════════════════════════════════════════════════════════
-    def processar_mensagem(self, msg):
-        tipo = msg.get("tipo")
-
-        if tipo == "conectado":
-            self.meu_numero = msg["jogador"]
+            self.meu_numero = resultado["jogador"]
             self.janela.title(f"Jogo Dara — Você é o Jogador {self.meu_numero}")
 
-        elif tipo == "aguardando":
-            self.label_status.config(text=msg["mensagem"], fg="orange")
+            if self.meu_numero == 1:
+                self.label_status.config(text="Aguardando o segundo jogador...", fg="orange")
+            else:
+                self.label_status.config(text="Conectado! Iniciando partida...", fg="green")
 
-        elif tipo == "inicio":
-            self.frame_conexao.destroy()
+            self._polling = True
+            threading.Thread(target=self._loop_polling, daemon=True).start()
+
+        except Exception as e:
+            self.label_status.config(text=f"Erro ao conectar: {e}", fg="red")
+
+    # ══════════════════════════════════════════════════════════
+    # POLLING (thread separada)
+    # ══════════════════════════════════════════════════════════
+
+    def _loop_polling(self):
+        """
+        Fica chamando get_estado() a cada POLL_INTERVAL segundos.
+        Diferente dos sockets (onde o servidor empurrava os dados),
+        aqui o cliente puxa — esse padrão se chama polling.
+        Usa proxy próprio porque proxies Pyro5 não são thread-safe.
+        """
+        uri        = f"PYRO:dara.servidor@{self._ultimo_ip}:{PORTA}"
+        poll_proxy = Pyro5.api.Proxy(uri)
+        falhas     = 0
+        while self._polling:
+            try:
+                idx    = self.ultimo_chat_idx
+                estado = poll_proxy.get_estado(idx)
+                falhas = 0
+                self.janela.after(0, self._processar_estado, estado)
+            except Exception as e:
+                print(f"[polling] {e}")
+                falhas += 1
+                if falhas >= 3:
+                    self.janela.after(0, self._servidor_desconectou)
+                    break
+            time.sleep(POLL_INTERVAL)
+
+    def _fechar_janela(self):
+        """Intercepta o X da janela: desiste da partida antes de fechar."""
+        if self._jogo_iniciado and not self.jogo_encerrado and self.proxy:
+            try:
+                self._rpc(lambda p: p.desistir(self.meu_numero))
+            except Exception:
+                pass
+        self._polling = False
+        self.janela.destroy()
+
+    def _servidor_desconectou(self):
+        """Chamado quando o polling falha 3 vezes seguidas."""
+        if not self.jogo_encerrado:
+            self.jogo_encerrado = True
+            self._polling       = False
+            messagebox.showerror("Conexão perdida", "O servidor desconectou!")
+            if self._jogo_iniciado:
+                self._mostrar_botao_nova_partida()
+
+    def _processar_estado(self, estado):
+        """Processa o estado recebido — sempre executado na thread principal via after()."""
+
+        # Novas mensagens de chat
+        novas = estado.get("novas_msgs", [])
+        for msg in novas:
+            self.adicionar_chat(f"Jogador {msg['jogador']}: {msg['mensagem']}")
+        self.ultimo_chat_idx += len(novas)
+
+        # Transição: tela de espera → interface do jogo
+        if not self._jogo_iniciado and estado["jogadores_conectados"] == 2:
+            self._jogo_iniciado = True
+            try:
+                self.frame_conexao.destroy()
+            except Exception:
+                pass
             self.construir_interface_jogo()
 
-        elif tipo == "estado":
-            self.estado = msg
+        if not self._jogo_iniciado:
+            return
+
+        self.estado = estado
+
+        if hasattr(self, "label_fase"):
             self.atualizar_interface()
-            if msg.get("mensagem"):
-                self.adicionar_chat(f"[Sistema] {msg['mensagem']}")
 
-        elif tipo == "chat":
-            self.adicionar_chat(f"Jogador {msg['jogador']}: {msg['mensagem']}")
+        # Mensagem de sistema (só exibe quando é nova, pelo msg_seq)
+        msg_seq = estado.get("msg_seq", 0)
+        if msg_seq > self.ultimo_msg_seq and estado.get("mensagem_sistema"):
+            self.ultimo_msg_seq = msg_seq
+            self.adicionar_chat(f"[Sistema] {estado['mensagem_sistema']}")
 
-        elif tipo == "erro":
-            self.adicionar_chat(f"[Erro] {msg['mensagem']}")
-
-        elif tipo == "fim":
-            # Jogo encerrado: mostra resultado e botão de nova partida
+        # Fim de jogo
+        if estado["vencedor"] and not self.jogo_encerrado:
             self.jogo_encerrado = True
-            self.adicionar_chat(f"[Sistema] {msg['mensagem']}")
-            if msg["vencedor"] == self.meu_numero:
-                messagebox.showinfo("FIM DE JOGO", f"Você VENCEU!\n{msg['mensagem']}")
+            self._polling       = False
+            msg = estado.get("mensagem_sistema", "")
+            if estado["vencedor"] == self.meu_numero:
+                messagebox.showinfo("FIM DE JOGO", f"Você VENCEU!\n{msg}")
             else:
-                messagebox.showinfo("FIM DE JOGO", f"Você perdeu.\n{msg['mensagem']}")
+                messagebox.showinfo("FIM DE JOGO", f"Você perdeu.\n{msg}")
             self._mostrar_botao_nova_partida()
-
-        elif tipo == "desconexao":
-            # Oponente desconectou (mas o servidor já cuida da vitória via "fim")
-            # Caso chegue sem "fim" antes, mostra botão também
-            if not self.jogo_encerrado:
-                self.jogo_encerrado = True
-                self.adicionar_chat(f"[Sistema] {msg['mensagem']}")
-                self._mostrar_botao_nova_partida()
 
     # ══════════════════════════════════════════════════════════
     # NOVA PARTIDA
     # ══════════════════════════════════════════════════════════
+
     def _mostrar_botao_nova_partida(self):
-        """Adiciona botão 'Nova Partida' na interface atual."""
-        if not hasattr(self, "_btn_nova") or not self._btn_nova:
+        if not self._btn_nova:
             self._btn_nova = tk.Button(
                 self.janela,
                 text="Nova Partida",
@@ -156,59 +206,51 @@ class ClienteDara:
             self._btn_nova.pack(pady=8)
 
     def _nova_partida(self):
-        """Fecha o socket, limpa tudo e volta à tela de conexão."""
         ip = self._ultimo_ip
 
-        # Fecha socket atual
-        try:
-            self.sock.close()
-        except Exception:
-            pass
+        self.proxy            = None
+        self.meu_numero       = None
+        self.estado           = None
+        self.selecionado      = None
+        self._polling         = False
+        self.jogo_encerrado   = False
+        self.ultimo_chat_idx  = 0
+        self.ultimo_msg_seq   = -1
+        self._jogo_iniciado   = False
+        self._btn_nova        = None
 
-        # Reseta estado
-        self.sock           = None
-        self.meu_numero     = None
-        self.estado         = None
-        self.selecionado    = None
-        self.buffer         = ""
-        self.jogo_encerrado = False
-        self._btn_nova      = None
-
-        # Remove todos os widgets e reconstrói a tela inicial
         for widget in self.janela.winfo_children():
             widget.destroy()
-
         self.construir_tela_conexao(ip=ip)
 
     # ══════════════════════════════════════════════════════════
     # INTERFACE DO JOGO
     # ══════════════════════════════════════════════════════════
+
     def construir_interface_jogo(self):
         self._btn_nova = None
         frame = tk.Frame(self.janela)
         frame.pack(padx=10, pady=10)
 
-        # Painel de informações
         frame_info = tk.Frame(frame, bd=2, relief="groove", pady=4)
         frame_info.pack(fill="x", pady=(0, 6))
 
-        self.label_fase     = tk.Label(frame_info, text="Fase: Colocação",
-                                       font=("Arial", 11, "bold"))
+        self.label_fase = tk.Label(frame_info, text="Fase: Posicionamento",
+                                   font=("Arial", 11, "bold"))
         self.label_fase.pack(side="left", padx=12)
 
-        self.label_turno    = tk.Label(frame_info, text="Turno: —",
-                                       font=("Arial", 11))
+        self.label_turno = tk.Label(frame_info, text="Turno: —",
+                                    font=("Arial", 11))
         self.label_turno.pack(side="left", padx=12)
 
-        self.label_pecas    = tk.Label(frame_info, text="Para colocar: J1=12 | J2=12",
-                                       font=("Arial", 11))
+        self.label_pecas = tk.Label(frame_info, text="Na mão: J1=12 | J2=12",
+                                    font=("Arial", 11))
         self.label_pecas.pack(side="left", padx=12)
 
-        self.label_capturas = tk.Label(frame_info, text="Capturas: J1=0 | J2=0",
+        self.label_capturas = tk.Label(frame_info, text="",
                                        font=("Arial", 11))
         self.label_capturas.pack(side="left", padx=12)
 
-        # Centro: tabuleiro + chat
         frame_centro = tk.Frame(frame)
         frame_centro.pack()
 
@@ -254,8 +296,9 @@ class ClienteDara:
         self.desenhar_tabuleiro()
 
     # ══════════════════════════════════════════════════════════
-    # DESENHO DO TABULEIRO
+    # TABULEIRO
     # ══════════════════════════════════════════════════════════
+
     def desenhar_tabuleiro(self):
         self.canvas.delete("all")
         tabuleiro = (self.estado["tabuleiro"]
@@ -268,11 +311,10 @@ class ClienteDara:
                 x2 = x1 + TAMANHO_CASA
                 y2 = y1 + TAMANHO_CASA
 
-                cor_fundo = (CORES["selecionado"]
-                             if self.selecionado == (l, c)
-                             else CORES["tabuleiro"])
+                cor = (CORES["selecionado"] if self.selecionado == (l, c)
+                       else CORES["tabuleiro"])
                 self.canvas.create_rectangle(x1, y1, x2, y2,
-                                             fill=cor_fundo, outline="#5a4010", width=2)
+                                             fill=cor, outline="#5a4010", width=2)
 
                 valor = tabuleiro[l][c]
                 if valor != 0:
@@ -293,16 +335,16 @@ class ClienteDara:
     # ══════════════════════════════════════════════════════════
     # ATUALIZAÇÃO DA UI
     # ══════════════════════════════════════════════════════════
+
     def atualizar_interface(self):
         if not self.estado:
             return
         fase          = self.estado["fase"]
         turno         = self.estado["turno"]
-        pecas         = self.estado["pecas"]               # peças na mão
-        no_tab        = self.estado["pecas_no_tabuleiro"]  # peças no tabuleiro
+        pecas         = self.estado["pecas"]
+        no_tab        = self.estado["pecas_no_tabuleiro"]
         deve_capturar = self.estado.get("deve_capturar")
 
-        # Nome da fase exibido ao jogador
         if fase == "posicionamento":
             nome_fase = "Posicionamento"
         elif fase == "captura" and deve_capturar:
@@ -311,7 +353,6 @@ class ClienteDara:
             nome_fase = "Movimentação"
         self.label_fase.config(text=f"Fase: {nome_fase}")
 
-        # Turno — se deve_capturar for eu, também é "minha vez"
         minha_vez = (turno == self.meu_numero or deve_capturar == self.meu_numero)
         if minha_vez:
             self.label_turno.config(text="Turno: SUA VEZ", fg="green")
@@ -321,14 +362,14 @@ class ClienteDara:
         self.label_pecas.config(
             text=f"Na mão: J1={pecas[0]} | J2={pecas[1]}   "
                  f"No tab: J1={no_tab[0]} | J2={no_tab[1]}")
-        self.label_capturas.config(text="")   # capturas calculadas pelas peças no tab
+        self.label_capturas.config(text="")
 
-        self.selecionado = None
         self.desenhar_tabuleiro()
 
     # ══════════════════════════════════════════════════════════
     # CLIQUE NO TABULEIRO
     # ══════════════════════════════════════════════════════════
+
     def clique_tabuleiro(self, event):
         if self.jogo_encerrado or not self.estado:
             return
@@ -348,17 +389,25 @@ class ClienteDara:
             if turno != self.meu_numero:
                 self.adicionar_chat("[Sistema] Não é sua vez!")
                 return
-            self.enviar({"tipo": "colocar", "linha": linha, "coluna": col})
+            res = self._rpc(lambda p: p.colocar(self.meu_numero, linha, col))
+            if res["ok"]:
+                self._atualizar_agora()
+            else:
+                self.adicionar_chat(f"[Erro] {res['erro']}")
 
-        # ── Fase de captura: deve capturar peça do oponente ───
+        # ── Capturar peça do oponente ──────────────────────────
         elif fase == "captura" and deve_capturar == self.meu_numero:
             oponente = 2 if self.meu_numero == 1 else 1
             if tabuleiro[linha][col] == oponente:
-                self.enviar({"tipo": "capturar", "linha": linha, "coluna": col})
+                res = self._rpc(lambda p: p.capturar(self.meu_numero, linha, col))
+                if res["ok"]:
+                    self._atualizar_agora()
+                else:
+                    self.adicionar_chat(f"[Erro] {res['erro']}")
             else:
                 self.adicionar_chat("[Sistema] Clique em uma peça do oponente para capturar.")
 
-        # ── Fase de captura: movimentação normal (dois cliques) ─
+        # ── Movimentação normal (dois cliques) ─────────────────
         elif fase == "captura" and not deve_capturar:
             if turno != self.meu_numero:
                 self.adicionar_chat("[Sistema] Não é sua vez!")
@@ -380,34 +429,46 @@ class ClienteDara:
                     self.selecionado = (linha, col)
                     self.desenhar_tabuleiro()
                 else:
-                    self.enviar({"tipo": "mover",
-                                 "de_linha": de_linha, "de_col": de_col,
-                                 "para_linha": linha,  "para_col": col})
+                    res = self._rpc(
+                        lambda p: p.mover(self.meu_numero, de_linha, de_col, linha, col))
                     self.selecionado = None
+                    if res["ok"]:
+                        self._atualizar_agora()
+                    else:
+                        self.adicionar_chat(f"[Erro] {res['erro']}")
 
     # ══════════════════════════════════════════════════════════
     # CHAT E DESISTÊNCIA
     # ══════════════════════════════════════════════════════════
+
     def enviar_chat(self, _event=None):
         texto = self.entrada_chat.get().strip()
         if texto:
-            self.enviar({"tipo": "chat", "mensagem": texto})
+            self._rpc(lambda p: p.chat(self.meu_numero, texto))
             self.entrada_chat.delete(0, tk.END)
 
     def desistir(self):
         if self.jogo_encerrado:
             return
         if messagebox.askyesno("Desistir", "Tem certeza que deseja desistir?"):
-            self.enviar({"tipo": "desistir"})
+            self._rpc(lambda p: p.desistir(self.meu_numero))
 
     # ══════════════════════════════════════════════════════════
-    # ENVIO
+    # RPC — executa chamada remota com lock para thread safety
     # ══════════════════════════════════════════════════════════
-    def enviar(self, dados):
+
+    def _atualizar_agora(self):
+        """Busca o estado imediatamente após uma ação, sem esperar o próximo poll."""
         try:
-            self.sock.sendall((json.dumps(dados) + "\n").encode("utf-8"))
-        except Exception as e:
-            print(f"Erro ao enviar: {e}")
+            idx    = self.ultimo_chat_idx
+            estado = self._rpc(lambda p: p.get_estado(idx))
+            self._processar_estado(estado)
+        except Exception:
+            pass
+
+    def _rpc(self, func):
+        with self.proxy_lock:
+            return func(self.proxy)
 
     def adicionar_chat(self, texto):
         if not hasattr(self, "area_chat"):
